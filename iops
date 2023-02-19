@@ -46,13 +46,16 @@ the loop. You can switch the read pattern using -p toggle.
 usage:
 
     iops [-n|--num-threads threads] [-t|--time time] [-m|--machine-readable]
-         [-b|--block-size size] [-p|--pattern random|sequential] <device>
+         [-b|--block-size size] [-p|--pattern random|sequential] 
+         [-o|--output outfile]
+         <device>
 
     num-threads         := number of concurrent io threads, default 32
     time                := time in seconds, default 2
     machine-readable    := used to switch off conversion into MiB and other SI units
     block-size          := block size (should be a multiple of 512)
     pattern             := random|sequential
+    outfile             := file to write results to
     device              := some block device, like /dev/sda or \\\\.\\PhysicalDrive0
 
 example:
@@ -70,6 +73,7 @@ import struct
 import random
 import time
 import threading
+import csv
 
 def getsizes(dev):
     """report media size and sector size for a device, platform specific code"""
@@ -202,7 +206,7 @@ def iops(dev, blocksize=512, pattern='random', t=2):
     Returns: IOs/s
     """
 
-    fh = open(dev, 'r')
+    fh = open(dev, 'r', encoding="ISO-8859-1")
     count = 0
     start = time.time()
     while time.time() < start+t:
@@ -214,6 +218,7 @@ def iops(dev, blocksize=512, pattern='random', t=2):
         blockdata = fh.read(blocksize)
         # check wraparound
         if len(blockdata) == 0 and pattern=='sequential':
+            fd = fh.fileno()
             os.lseek(fd, 0, os.SEEK_SET)
     end = time.time()
 
@@ -233,6 +238,7 @@ if __name__ == '__main__':
     dev = None                  # /dev/sda
     exact_blocksize = False
     pattern='random'            # random|sequential
+    outfile = None
     sectorsize=0
     mediasize=0
 
@@ -258,6 +264,8 @@ if __name__ == '__main__':
             pattern = sys.argv.pop(0)
             if not pattern in ['random', 'sequential']:
                 raise SystemExit("unknown pattern: %s" % pattern)
+        elif arg in ['-o', '--output']:
+            outfile = sys.argv.pop(0)
         else:
             dev = arg
 
@@ -267,7 +275,13 @@ if __name__ == '__main__':
                 mediasize, sectorsize = getsizes(dev)
         else:
             print("sectorsize and mediasize override")
-        print("%s, %s, sectorsize=%dB, #threads=%d, pattern=%s:" % (dev, greek(mediasize, 2, units), sectorsize, num_threads, pattern))
+        output_rows = []
+        
+        run_info = "%s, %sB, sectorsize=%dB, #threads=%d, pattern=%s:" % (dev, greek(mediasize, 2, units), sectorsize, num_threads, pattern)
+        headers = ["Block size", "I/O operations per second", "Throughput (bytes/second)"," Throughput (bits/second)"]
+        output_rows.append(headers)
+        print(run_info)
+
         _iops = num_threads+1 # initial loop
         while _iops > max(1, num_threads/4) and blocksize < mediasize:
             # threading boilerplate
@@ -297,6 +311,7 @@ if __name__ == '__main__':
                 greek(8*bandwidth, 1, units)
                 )
             )
+            output_rows.append([blocksize, _iops, bandwidth, 8 * bandwidth])
 
             if exact_blocksize:
                 break
@@ -306,5 +321,12 @@ if __name__ == '__main__':
         raise SystemExit(e)
     except KeyboardInterrupt:
         raise SystemExit("caught ctrl-c, bye.")
+    
+    # Write to output file if specified
+    if outfile:
+        with open(outfile, 'w') as f:
+            f.write(run_info + '\n')
+            csv_writer = csv.writer(f, delimiter=',')
+            csv_writer.writerows(output_rows)
 
 # eof.
