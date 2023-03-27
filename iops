@@ -199,34 +199,71 @@ def greek(value, precision=0, prefix=None):
         fmt='%%%d.%df %%s' % (4+precision, precision)
         return fmt % (float(value)/factor, suffix)
 
-def iops(dev, blocksize=512, pattern='random', t=2):
+def iops(dev, blocksize=512, pattern='random', t=2, rw='read'):
     """measure input/output operations per second
     Perform random 512b aligned reads of blocksize bytes on fh for t seconds
     and print a stats line
     Returns: IOs/s
     """
 
-    fh = open(dev, 'r', encoding="ISO-8859-1")
-    count = 0
-    start = time.time()
-    while time.time() < start+t:
-        count += 1
-        if pattern=='random':
-            pos = random.randint(0, mediasize - blocksize) # need at least one block left
-            pos &= ~(sectorsize-1)   # sector alignment at blocksize
-            fh.seek(pos)
-        blockdata = fh.read(blocksize)
-        # check wraparound
-        if len(blockdata) == 0 and pattern=='sequential':
-            fd = fh.fileno()
-            os.lseek(fd, 0, os.SEEK_SET)
-    end = time.time()
+    if rw == 'read':
+        fh = open(dev, 'r', encoding="ISO-8859-1")
+        count = 0
+        lat_time_total = 0
 
-    t = end - start
+        start = time.time()
+        while time.time() < start+t:
+            count += 1
+            lat_time_start = time.time()
+            if pattern=='random':
+                pos = random.randint(0, mediasize - blocksize) # need at least one block left
+                pos &= ~(sectorsize-1)   # sector alignment at blocksize
+                fh.seek(pos)
+            blockdata = fh.read(blocksize)
+            lat_time_end = time.time()
+            lat_time = lat_time_end - lat_time_start
+            lat_time_total += lat_time
+            # check wraparound
+            if len(blockdata) == 0 and pattern=='sequential':
+                fd = fh.fileno()
+                os.lseek(fd, 0, os.SEEK_SET)
+        end = time.time()
 
-    fh.close()
+        t = end - start
 
-    return count/t
+        fh.close()
+    else:
+        fh = open(f'{dev}/iops-test-file', 'w', encoding="ISO-8859-1")
+        count = 0
+        lat_time_total = 0
+        bytes_to_write = "0" * blocksize
+
+        start = time.time()
+        while time.time() < start+t:
+            count += 1
+            lat_time_start = time.time()
+            if pattern=='random':
+                pos = random.randint(0, mediasize - blocksize) # need at least one block left
+                pos &= ~(sectorsize-1)   # sector alignment at blocksize
+                fh.seek(pos)
+            blockdata = fh.write(bytes_to_write)
+            lat_time_end = time.time()
+            lat_time = lat_time_end - lat_time_start
+            lat_time_total += lat_time
+            # check wraparound
+            if blockdata == 0 and pattern=='sequential':
+                fd = fh.fileno()
+                os.lseek(fd, 0, os.SEEK_SET)
+        end = time.time()
+        
+        t = end - start
+
+        fh.close()
+
+    return count / t, lat_time_total, count
+
+
+
 
 
 if __name__ == '__main__':
@@ -241,6 +278,7 @@ if __name__ == '__main__':
     outfile = None
     sectorsize=0
     mediasize=0
+    rw = 'read'                 # read|write
 
     if len(sys.argv) < 2:
         raise SystemExit(USAGE)
@@ -264,13 +302,17 @@ if __name__ == '__main__':
             pattern = sys.argv.pop(0)
             if not pattern in ['random', 'sequential']:
                 raise SystemExit("unknown pattern: %s" % pattern)
+        elif arg in ['-r', '--readwrite']:
+            rw = sys.argv.pop(0)
+            if not rw in ['read', 'write']:
+                raise SystemExit("unknown IO type: %s" % pattern)
         elif arg in ['-o', '--output']:
             outfile = sys.argv.pop(0)
         else:
             dev = arg
 
     # run benchmark
-    try:
+    try:    
         if (not (sectorsize > 0 and mediasize > 0)):
                 mediasize, sectorsize = getsizes(dev)
         else:
@@ -278,40 +320,49 @@ if __name__ == '__main__':
         output_rows = []
         
         run_info = "%s, %sB, sectorsize=%dB, #threads=%d, pattern=%s:" % (dev, greek(mediasize, 2, units), sectorsize, num_threads, pattern)
-        headers = ["Block size", "I/O operations per second", "Throughput (bytes/second)"," Throughput (bits/second)"]
+        headers = ["Block size", "I/O operations per second", "Throughput (bytes/second)"," Throughput (bits/second)", "Average Latency (seconds)"]
         output_rows.append(headers)
         print(run_info)
+
 
         _iops = num_threads+1 # initial loop
         while _iops > max(1, num_threads/4) and blocksize < mediasize:
             # threading boilerplate
             threads = []
-            results = []
+            iops_results = []
+            lat_results = []
+            ios_results = []
             
-            def results_wrap(results, func, *__args, **__kw):
+            def results_wrap(iops_results, lat_results, ios_results, func, *__args, **__kw):
                 """collect return values from func"""
-                result = func(*__args, **__kw)
-                results.append(result)
+                iops, lat, ios = func(*__args, **__kw)
+                iops_results.append(iops)
+                lat_results.append(lat)
+                ios_results.append(ios)
 
             for i in range(0, num_threads):
                 _t = threading.Thread(target=results_wrap,
-                                    args=(results, iops, dev, blocksize, pattern, t,))
+                                    args=(iops_results, lat_results, ios_results, iops, dev, blocksize, pattern, t, rw))
                 _t.start()
                 threads.append(_t)
 
             for _t in threads:
                 _t.join()
-            _iops = sum(results)
+            _iops = sum(iops_results)
+            tot_ios = sum(ios_results)
+            tot_lat = sum(lat_results)
+            avg_lat = tot_lat / tot_ios
 
             bandwidth = int(blocksize*_iops)
-            print(" %sB blocks: %6.1f IO/s, %sB/s (%sbit/s)" % (
+            print(" %sB blocks: %6.1f IO/s, %sB/s (%sbit/s), %s s" % (
                 greek(blocksize, 0, units),
                 _iops,
                 greek(bandwidth, 1, units),
-                greek(8*bandwidth, 1, units)
+                greek(8*bandwidth, 1, units),
+                avg_lat
                 )
             )
-            output_rows.append([blocksize, _iops, bandwidth, 8 * bandwidth])
+            output_rows.append([blocksize, _iops, bandwidth, 8 * bandwidth, avg_lat])
 
             if exact_blocksize:
                 break
